@@ -11,9 +11,11 @@ import (
 )
 
 var (
-	ErrInvalidToken    = errors.New("token is malformed")
-	ErrExpiredToken    = errors.New("token has expired")
-	ErrInvalidSignature = errors.New("signature verification failed")
+	ErrInvalidToken       = errors.New("token is malformed")
+	ErrExpiredToken       = errors.New("token has expired")
+	ErrInvalidSignature   = errors.New("signature verification failed")
+	ErrInsufficientScopes = errors.New("token missing required scopes")
+	ErrRevokedToken       = errors.New("token has been revoked")
 )
 
 // Claims represents the payload of a JWT.
@@ -35,6 +37,12 @@ type Token struct {
 // Issuer creates signed JWT tokens.
 type Issuer interface {
 	Issue(claims Claims) (Token, error)
+	Refresh(raw string, v Validator) (Token, error)
+}
+
+// RevocationChecker determines whether a token has been revoked by its ID.
+type RevocationChecker interface {
+	IsRevoked(id string) bool
 }
 
 // Validator verifies and parses JWT tokens.
@@ -46,9 +54,11 @@ type Validator interface {
 type Option func(*config)
 
 type config struct {
-	secret     []byte
-	defaultTTL time.Duration
-	audience   string
+	secret         []byte
+	defaultTTL     time.Duration
+	audience       string
+	requiredScopes []string
+	revocation     RevocationChecker
 }
 
 // WithSecret sets the HMAC signing secret.
@@ -69,6 +79,22 @@ func WithDefaultTTL(d time.Duration) Option {
 func WithAudience(aud string) Option {
 	return func(c *config) {
 		c.audience = aud
+	}
+}
+
+// WithRequiredScopes sets scopes that must be present in the token's Extra["scopes"] field.
+// Scopes in the token are expected to be space-separated.
+func WithRequiredScopes(scopes ...string) Option {
+	return func(c *config) {
+		c.requiredScopes = scopes
+	}
+}
+
+// WithRevocationCheck sets a RevocationChecker used during validation
+// to reject tokens that have been revoked.
+func WithRevocationCheck(checker RevocationChecker) Option {
+	return func(c *config) {
+		c.revocation = checker
 	}
 }
 
@@ -152,6 +178,27 @@ func (i *hs256Issuer) Issue(claims Claims) (Token, error) {
 	return Token{Raw: raw, Claims: claims}, nil
 }
 
+func (i *hs256Issuer) Refresh(raw string, v Validator) (Token, error) {
+	old, err := v.Validate(raw)
+	if err != nil {
+		return Token{}, err
+	}
+
+	now := time.Now()
+	refreshed := Claims{
+		Subject:  old.Subject,
+		Audience: old.Audience,
+		ID:       old.ID,
+		Extra:    old.Extra,
+		IssuedAt: now,
+	}
+	if i.cfg.defaultTTL > 0 {
+		refreshed.ExpiresAt = now.Add(i.cfg.defaultTTL)
+	}
+
+	return i.Issue(refreshed)
+}
+
 // hs256Validator implements Validator using HMAC-SHA256.
 type hs256Validator struct {
 	cfg *config
@@ -200,8 +247,30 @@ func (v *hs256Validator) Validate(raw string) (Claims, error) {
 		}
 	}
 
+	if v.cfg.revocation != nil && claims.ID != "" {
+		if v.cfg.revocation.IsRevoked(claims.ID) {
+			return Claims{}, ErrRevokedToken
+		}
+	}
+
 	if v.cfg.audience != "" && claims.Audience != v.cfg.audience {
 		return Claims{}, ErrInvalidToken
+	}
+
+	if len(v.cfg.requiredScopes) > 0 {
+		granted := make(map[string]bool)
+		if claims.Extra != nil {
+			for _, s := range strings.Split(claims.Extra["scopes"], " ") {
+				if s != "" {
+					granted[s] = true
+				}
+			}
+		}
+		for _, required := range v.cfg.requiredScopes {
+			if !granted[required] {
+				return Claims{}, ErrInsufficientScopes
+			}
+		}
 	}
 
 	return claims, nil

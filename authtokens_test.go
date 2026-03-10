@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+// fakeRevocationList is a fake RevocationChecker for testing.
+type fakeRevocationList struct {
+	revoked map[string]bool
+}
+
+func (f *fakeRevocationList) IsRevoked(id string) bool {
+	return f.revoked[id]
+}
+
 func TestIssueAndValidate(t *testing.T) {
 	secret := []byte("test-secret-key")
 	issuer := NewIssuer(WithSecret(secret))
@@ -205,5 +214,171 @@ func TestDefaultTTL(t *testing.T) {
 	parts := strings.Split(token.Raw, ".")
 	if len(parts) != 3 {
 		t.Errorf("Token has %d parts, want 3", len(parts))
+	}
+}
+
+func TestScopeValidation(t *testing.T) {
+	secret := []byte("test-secret-key")
+	issuer := NewIssuer(WithSecret(secret))
+
+	token, err := issuer.Issue(Claims{
+		Subject:   "user:123",
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+		Extra:     map[string]string{"scopes": "read write admin"},
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	// Validator requiring scopes the token has
+	v := NewValidator(
+		WithSecret(secret),
+		WithRequiredScopes("read", "write"),
+	)
+	if _, err := v.Validate(token.Raw); err != nil {
+		t.Errorf("Validate() with sufficient scopes error = %v", err)
+	}
+
+	// Validator requiring a scope the token lacks
+	v = NewValidator(
+		WithSecret(secret),
+		WithRequiredScopes("read", "delete"),
+	)
+	_, err = v.Validate(token.Raw)
+	if !errors.Is(err, ErrInsufficientScopes) {
+		t.Errorf("Validate() error = %v, want %v", err, ErrInsufficientScopes)
+	}
+}
+
+func TestScopeValidationNoScopes(t *testing.T) {
+	secret := []byte("test-secret-key")
+	issuer := NewIssuer(WithSecret(secret))
+
+	token, err := issuer.Issue(Claims{
+		Subject:   "user:123",
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	v := NewValidator(
+		WithSecret(secret),
+		WithRequiredScopes("read"),
+	)
+	_, err = v.Validate(token.Raw)
+	if !errors.Is(err, ErrInsufficientScopes) {
+		t.Errorf("Validate() error = %v, want %v", err, ErrInsufficientScopes)
+	}
+}
+
+func TestRevocationCheck(t *testing.T) {
+	secret := []byte("test-secret-key")
+	issuer := NewIssuer(WithSecret(secret))
+
+	token, err := issuer.Issue(Claims{
+		Subject:   "user:123",
+		ID:        "token-revoked",
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	checker := &fakeRevocationList{revoked: map[string]bool{"token-revoked": true}}
+	v := NewValidator(
+		WithSecret(secret),
+		WithRevocationCheck(checker),
+	)
+
+	_, err = v.Validate(token.Raw)
+	if !errors.Is(err, ErrRevokedToken) {
+		t.Errorf("Validate() error = %v, want %v", err, ErrRevokedToken)
+	}
+}
+
+func TestRevocationCheckNonRevoked(t *testing.T) {
+	secret := []byte("test-secret-key")
+	issuer := NewIssuer(WithSecret(secret))
+
+	token, err := issuer.Issue(Claims{
+		Subject:   "user:123",
+		ID:        "token-active",
+		ExpiresAt: time.Now().Add(1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	checker := &fakeRevocationList{revoked: map[string]bool{"token-revoked": true}}
+	v := NewValidator(
+		WithSecret(secret),
+		WithRevocationCheck(checker),
+	)
+
+	claims, err := v.Validate(token.Raw)
+	if err != nil {
+		t.Errorf("Validate() error = %v", err)
+	}
+	if claims.Subject != "user:123" {
+		t.Errorf("Subject = %q, want %q", claims.Subject, "user:123")
+	}
+}
+
+func TestRefresh(t *testing.T) {
+	secret := []byte("test-secret-key")
+	ttl := 2 * time.Hour
+	issuer := NewIssuer(WithSecret(secret), WithDefaultTTL(ttl))
+	validator := NewValidator(WithSecret(secret))
+
+	original, err := issuer.Issue(Claims{
+		Subject:  "user:123",
+		Audience: "api.example.com",
+		ID:       "tok-1",
+		IssuedAt: time.Now().Add(-30 * time.Minute),
+		Extra:    map[string]string{"role": "admin"},
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	refreshed, err := issuer.Refresh(original.Raw, validator)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+
+	if refreshed.Claims.Subject != "user:123" {
+		t.Errorf("Subject = %q, want %q", refreshed.Claims.Subject, "user:123")
+	}
+	if refreshed.Claims.Audience != "api.example.com" {
+		t.Errorf("Audience = %q, want %q", refreshed.Claims.Audience, "api.example.com")
+	}
+	if refreshed.Claims.Extra["role"] != "admin" {
+		t.Errorf("Extra[role] = %q, want %q", refreshed.Claims.Extra["role"], "admin")
+	}
+	if refreshed.Claims.IssuedAt.Before(original.Claims.IssuedAt) {
+		t.Error("Refreshed token IssuedAt should not be before original")
+	}
+	if refreshed.Raw == original.Raw {
+		t.Error("Refreshed token should have a different Raw value")
+	}
+}
+
+func TestRefreshExpiredToken(t *testing.T) {
+	secret := []byte("test-secret-key")
+	issuer := NewIssuer(WithSecret(secret), WithDefaultTTL(1*time.Hour))
+	validator := NewValidator(WithSecret(secret))
+
+	expired, err := issuer.Issue(Claims{
+		Subject:   "user:123",
+		ExpiresAt: time.Now().Add(-1 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	_, err = issuer.Refresh(expired.Raw, validator)
+	if !errors.Is(err, ErrExpiredToken) {
+		t.Errorf("Refresh() error = %v, want %v", err, ErrExpiredToken)
 	}
 }
